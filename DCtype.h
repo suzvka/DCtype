@@ -98,19 +98,23 @@ namespace DC {
 
     /// @brief Runtime domain identifier for registry indexing
     struct DomainId {
-        std::uintptr_t value{};
+        std::size_t value{};
 
-        template<class Base, class Enum>
+        template<class Base, class Enum, class KeyStrat>
         static constexpr DomainId make() noexcept {
-            auto h1 = std::hash<std::type_index>{}(std::type_index(typeid(Base)));
-            auto h2 = std::hash<std::type_index>{}(std::type_index(typeid(Enum)));
-            return DomainId{ h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2)) };
+            const auto h1 = std::hash<std::type_index>{}(std::type_index(typeid(Base)));
+            const auto h2 = std::hash<std::type_index>{}(std::type_index(typeid(Enum)));
+            const auto h3 = std::hash<std::type_index>{}(std::type_index(typeid(KeyStrat)));
+            // 64-bit 友好的 hash combine
+            auto seed = h1;
+            seed ^= h2 + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+            seed ^= h3 + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+            return DomainId{ seed };
         }
 
-        friend bool operator==(DomainId a, DomainId b) noexcept {
-            return a.value == b.value;
-        }
+        friend bool operator==(DomainId a, DomainId b) noexcept { return a.value == b.value; }
     };
+
 
     //===================================================================//
     // Type Traits and Concepts                                         //
@@ -139,7 +143,6 @@ namespace DC {
     class FrozenMap {
     private:
         std::vector<std::pair<TypeKey, Enum>> entries_;
-        bool is_sorted_{ false };
 
     public:
         /// @brief Lookup with fallback value
@@ -166,7 +169,6 @@ namespace DC {
                 [](const auto& a, const auto& b) {
                     return a.first.value < b.first.value;
                 });
-            map.is_sorted_ = true;
             return map;
         }
     };
@@ -175,30 +177,30 @@ namespace DC {
     /// Used during registration phase
     template<class Enum>
     class MutableBuilder {
-    private:
         std::vector<std::pair<TypeKey, Enum>> entries_;
-
     public:
-        /// @brief Insert or update mapping
         bool insert(TypeKey k, Enum v) {
             auto it = std::find_if(entries_.begin(), entries_.end(),
                 [k](const auto& pair) { return pair.first == k; });
-
             if (it != entries_.end()) {
                 Diagnostics::onDuplicateRegistration("", k);
                 it->second = v;
                 return true;
             }
-
             entries_.emplace_back(k, v);
             return true;
         }
 
-        /// @brief Convert to immutable frozen map
-        FrozenMap<Enum> freeze() {
-            return FrozenMap<Enum>::from(std::move(entries_));
+        // 新增：未冻结阶段的只读查找
+        Enum getOr(Enum fallback, TypeKey key) const noexcept {
+            auto it = std::find_if(entries_.begin(), entries_.end(),
+                [key](const auto& p) { return p.first == key; });
+            return it == entries_.end() ? fallback : it->second;
         }
+
+        FrozenMap<Enum> freeze() { return FrozenMap<Enum>::from(std::move(entries_)); }
     };
+
 
     //===================================================================//
     // Domain Storage                                                    //
@@ -209,11 +211,8 @@ namespace DC {
     template<class Base, class Enum, class KeyStrat = RTTIKeyStrategy>
     class DomainStorage {
     public:
-        using base_type = Base;
-        using enum_type = Enum;
-        using strategy = KeyStrat;
+        using base_type = Base; using enum_type = Enum; using strategy = KeyStrat;
 
-        /// @brief Register type-to-enum mapping
         template<class Derived>
         bool registerType(Enum value) {
             static_assert(std::is_base_of_v<Base, Derived>, "Derived must inherit from Base");
@@ -223,23 +222,41 @@ namespace DC {
             return builder_.insert(key, value);
         }
 
-        /// @brief Freeze storage for optimized lookups
         void freeze() {
             std::scoped_lock lk(mu_);
             if (frozen_) return;
+            if (queried_) Diagnostics::onFreezeAfterQuery(domainName<Base, Enum, KeyStrat>());
             frozen_map_ = std::move(builder_).freeze();
             frozen_ = true;
         }
 
-        /// @brief Query enum value for object's dynamic type
         Enum queryOr(Enum fallback, const Base& obj) const noexcept {
-            auto key = KeyStrat::template keyOfDynamic<Base>(obj);
-            return frozen_map_.getOr(fallback, key);
+            const auto key = KeyStrat::template keyOfDynamic<Base>(obj);
+            if (frozen_) {
+                auto v = frozen_map_.getOr(fallback, key);
+                if (v == fallback) Diagnostics::onMiss(domainName<Base, Enum, KeyStrat>(), key);
+                return v;
+            }
+            {
+                std::scoped_lock lk(mu_);
+                queried_ = true;
+                auto v = builder_.getOr(fallback, key);
+                if (v == fallback) Diagnostics::onMiss(domainName<Base, Enum, KeyStrat>(), key);
+                return v;
+            }
         }
 
     private:
+        template<class B, class E, class K>
+        static std::string domainName() {
+            return std::string("Base=") + typeid(B).name()
+                + ", Enum=" + typeid(E).name()
+                + ", KeyStrat=" + typeid(K).name();
+        }
+
         mutable std::mutex mu_;
         bool frozen_{ false };
+        mutable bool queried_{ false };
         MutableBuilder<Enum> builder_;
         FrozenMap<Enum> frozen_map_;
     };
@@ -279,9 +296,8 @@ namespace DC {
         /// @brief Get or create domain handle
         template<class Base, class Enum, class KeyStrat = RTTIKeyStrategy>
         DomainHandle<Base, Enum, KeyStrat>& domain() {
-            const auto id = DomainId::make<Base, Enum>();
+            const auto id = DomainId::template make<Base, Enum, KeyStrat>();
             std::scoped_lock lk(mu_);
-
             auto it = domains_.find(id.value);
             if (it == domains_.end()) {
                 auto handle = std::make_unique<DomainHandle<Base, Enum, KeyStrat>>();
@@ -289,7 +305,6 @@ namespace DC {
                 domains_[id.value] = std::move(handle);
                 return *ptr;
             }
-
             auto* handle = static_cast<DomainHandle<Base, Enum, KeyStrat>*>(it->second.get());
             return *handle;
         }
@@ -383,6 +398,19 @@ namespace DC {
     //===================================================================//
     // Domain Tag Convenience API                                       //
     //===================================================================//
+    template<class Derived, class KeyStrat = RTTIKeyStrategy, class... Pairs>
+    void registerTypeToMany(Pairs&&... pairs) {
+        auto register_one = [](auto&& pair) {
+            using PairT = std::decay_t<decltype(pair)>;
+            using Tag = typename PairT::first_type;   // DomainTag<Base, Enum>
+            using Base = typename Tag::base_type;
+            using Enum = typename Tag::enum_type;
+            static_assert(std::is_same_v<Enum, decltype(pair.second)>,
+                "Enum value type mismatch with DomainTag");
+            registerType<Base, Enum, Derived, KeyStrat>(pair.second);
+            };
+        (register_one(std::forward<Pairs>(pairs)), ...);
+    }
 
     /// @brief Register type using domain tag syntax
     template<class Domain, class Derived, class KeyStrat = RTTIKeyStrategy>
