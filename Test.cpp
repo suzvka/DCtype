@@ -40,7 +40,8 @@ enum class RenderBackend {
 enum class MyEnum {
 	ValueA,
 	ValueB,
-	ValueC
+	ValueC,
+	Unknown
 };
 
 void simplified_test() {
@@ -51,22 +52,45 @@ void simplified_test() {
     DC::registerType<int, MyEnum>(MyEnum::ValueA);
     DC::registerType<double, MyEnum>(MyEnum::ValueB);
 
+    // 配置未注册类型的返回值
+    DC::setFallback<MyEnum>(MyEnum::Unknown);
+    // REMOVED explicit freeze to test auto-freeze
+    // DC::freeze<MyEnum>();
+
     // 查询方式1：传入实例
     std::string str = "hello";
     int num = 42;
     double pi = 3.14;
+
+    // First query should trigger auto-freeze
+    assert((DC::getType<MyEnum>(str) == MyEnum::ValueC));
+    assert((DC::getType<MyEnum>(num) == MyEnum::ValueA));
+    assert((DC::getType<MyEnum>(pi) == MyEnum::ValueB));
+
+    // Verify it is indeed frozen
+    assert(DC::GlobalRegistry::instance().getRegistry<MyEnum>().isFrozen());
     
-    assert(DC::getType<MyEnum>(str) == MyEnum::ValueC);
-    assert(DC::getType<MyEnum>(num) == MyEnum::ValueA);
-    assert(DC::getType<MyEnum>(pi) == MyEnum::ValueB);
+    // Verify registration fails after auto-freeze
+    bool regResult = DC::registerType<float, MyEnum>(MyEnum::ValueA);
+    assert(regResult == false);
 
     // 查询方式2：不需要实例
-    ((void)((!!(DC::getType<MyEnum, std::string>() == MyEnum::ValueC)) || (_wassert(L"DC::getType<MyEnum", L"E:\\DClib\\DCtype\\Test.cpp", (unsigned)(64)), 0)));
-    ((void)((!!(DC::getType<MyEnum, int>() == MyEnum::ValueA)) || (_wassert(L"DC::getType<MyEnum", L"E:\\DClib\\DCtype\\Test.cpp", (unsigned)(65)), 0)));
-    ((void)((!!(DC::getType<MyEnum, double>() == MyEnum::ValueB)) || (_wassert(L"DC::getType<MyEnum", L"E:\\DClib\\DCtype\\Test.cpp", (unsigned)(66)), 0)));
+    assert((DC::getType<MyEnum, std::string>() == MyEnum::ValueC));
+    assert((DC::getType<MyEnum, int>() == MyEnum::ValueA));
+    assert((DC::getType<MyEnum, double>() == MyEnum::ValueB));
 
-    // 测试未注册类型
-    ((void)((!!(DC::getTypeOr<MyEnum, float>(MyEnum::ValueA) == MyEnum::ValueA)) || (_wassert(L"DC::getTypeOr<MyEnum", L"E:\\DClib\\DCtype\\Test.cpp", (unsigned)(69)), 0)));
+    // 测试未注册类型：getTypeOr 仍可覆盖 fallback
+    assert((DC::getTypeOr<MyEnum, float>(MyEnum::ValueA) == MyEnum::ValueA));
+
+    // 测试未注册类型：getType 使用注册表 fallback
+    assert((DC::getType<MyEnum, float>() == MyEnum::Unknown));
+
+    // 测试 tryGetType
+    auto opt1 = DC::tryGetType<MyEnum, std::string>();
+    assert(opt1.has_value() && opt1.value() == MyEnum::ValueC);
+
+    auto opt2 = DC::tryGetType<MyEnum, float>();
+    assert(!opt2.has_value());
 
     std::cout << "Simplified API tests passed" << std::endl;
 }
